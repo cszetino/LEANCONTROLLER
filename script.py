@@ -1,293 +1,260 @@
-"""
-LEAN-INTO-CORNER CONTROLLER + DEMO HARNESS (MINIMAL PLOTS + OCCUPANT "DOOR-SLAM" METRIC)
-
-Includes:
-- Controller with curvature estimate kappa_hat ~= yaw_rate_r / v
-- Desired lean alpha_d = atan(a_y/g), with alpha_max + alpha_rate_max constraints
-- Fallback speed cap v_max = sqrt( g*tan(alpha_max) / |kappa| ), suppressed near straight driving
-- Simple roll plant + PD tracking torque for simulation
-- Minimal plots + direct proof signal:
-    a_side_seat = a_y*cos(alpha) - g*sin(alpha)   (target ~ 0)
-
-Run:
-  python compiled_lean_demo_minplots.py
-
-Tip for profiling:
-  set PLOT = False before running cProfile
-"""
+# script.py
+# Problem 1: Lean-Into-Corner Seat Controller
+# Enhancement: Map-curvature vs yaw-rate-only reference generation
+# FIXED: Explicit occupant comfort metric (lateral specific force)
+# ALIGNED: Seat-only tilt, mass cancels, friction excluded by assumption
 
 import math
 import time
-from dataclasses import dataclass
-
 import numpy as np
 import matplotlib.pyplot as plt
 
+# ============================================================
+# MODELING ASSUMPTIONS
+# ============================================================
+# 1) Vehicle does NOT tilt; the SEAT tilts
+# 2) Occupant is rigidly attached to the seat (no slip)
+# 3) Comfort is defined as zero lateral specific force
+# 4) Occupant mass cancels from comfort equations
+# 5) Seat-occupant friction is not explicitly modeled
+# 6) Yaw-rate-only controller estimates lateral acceleration indirectly
+# ============================================================
 
-# Toggle plotting for speed/profiling
-PLOT = True
+# ============================================================
+# CONFIG
+# ============================================================
 
+T_SIM = 20.0
+DT = 0.01
 
-# -------------------------
-# Utilities
-# -------------------------
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+# Yaw-rate sensor model
+YAW_BIAS_RAD_S = 0.0
+YAW_NOISE_STD = 0.01
+YAW_FILTER_TAU_S = 0.25
 
+V_EPS = 1e-3
+RNG_SEED = 1
 
-# -------------------------
-# Controller (Part A + optional torque for plant tracking)
-# -------------------------
-@dataclass
+# ============================================================
+# PARAMETERS
+# ============================================================
+
 class LeanControllerParams:
-    g: float = 9.81
+    def __init__(self):
+        self.g = 9.81
 
-    # comfort + actuator constraints
-    alpha_max_rad: float = math.radians(10.0)     # max tilt angle
-    alpha_rate_max: float = math.radians(30.0)    # max tilt rate (rad/s)
-    tau_max: float = 800.0                        # torque limit (demo)
+        # Seat roll limits
+        self.alpha_max_deg = 15.0
+        self.alpha_max_rad = math.radians(self.alpha_max_deg)
 
-    # simple roll plant (seat/cabin actuator model)
-    I: float = 120.0
-    b: float = 40.0
+        # Seat roll dynamics (assumed)
+        self.I = 30.0     # kg*m^2
+        self.b = 8.0      # N*m*s/rad
 
-    # tracking gains
-    kp: float = 8.0
-    kd: float = 2.0
+        # PD gains (design parameters)
+        self.Kp = 120.0
+        self.Kd = 25.0
 
-    # numerical safety
-    v_min_for_kappa: float = 0.5   # avoid r/v blow-up near zero speed (m/s)
-    kappa_max: float = 0.5         # clamp curvature estimate (1/m)
+        # Speed tracking
+        self.v_track_tau = 1.0
 
-    # speed-cap suppression near straight driving
-    kappa_min_for_cap: float = 1e-3   # below this, treat as "no cap" (1/m)
-    cap_value_when_straight: float = float("nan")  # NaN makes plots skip those points
+# ============================================================
+# HELPERS
+# ============================================================
 
+def clamp(x, lo, hi):
+    return lo if x < lo else (hi if x > hi else x)
 
-class LeanIntoCornerController:
-    """
-    Part (a) core:
-      - estimate curvature kappa_hat ~ yaw_rate_r / v
-      - compute desired lean alpha_d = atan( (v^2*kappa_hat)/g )
-      - apply alpha_max and alpha_rate_max constraints
-      - compute fallback speed cap v_max (planner/braking can enforce)
+def lowpass_1st_order(x_prev, x_meas, tau, dt):
+    a = dt / max(tau, 1e-9)
+    return x_prev + a * (x_meas - x_prev)
 
-    Optional for simulation:
-      - PD tracking to generate torque tau for roll plant: I*alpha_ddot + b*alpha_dot = tau
-    """
+def speed_limit_for_curvature(kappa, alpha_max_rad, g):
+    if abs(kappa) < 1e-9:
+        return float("inf")
+    ay_max = g * math.tan(alpha_max_rad)
+    return math.sqrt(ay_max / abs(kappa))
 
-    def __init__(self, params: LeanControllerParams):
-        self.p = params
-        self._alpha_d_prev = 0.0
+def speed_dynamics_step(v, v_cmd, tau_v, dt):
+    return v + (v_cmd - v) * (dt / max(tau_v, 1e-9))
 
-    def estimate_curvature(self, v: float, yaw_rate_r: float) -> float:
-        if abs(v) < self.p.v_min_for_kappa:
-            return 0.0
-        kappa = yaw_rate_r / v
-        return clamp(kappa, -self.p.kappa_max, self.p.kappa_max)
-
-    def fallback_speed_cap(self, kappa_hat: float) -> float:
-        # Suppress cap near straight driving to avoid huge spikes when |kappa| -> 0
-        if abs(kappa_hat) < self.p.kappa_min_for_cap:
-            return self.p.cap_value_when_straight
-
-        a_y_max = self.p.g * math.tan(self.p.alpha_max_rad)
-        return math.sqrt(a_y_max / abs(kappa_hat))
-
-    def step(self, v: float, yaw_rate_r: float, alpha: float, alpha_dot: float, dt: float):
-        if dt <= 0.0:
-            raise ValueError("dt must be positive")
-
-        # 1) curvature estimate
-        kappa_hat = self.estimate_curvature(v, yaw_rate_r)
-
-        # 2) lateral accel from lecture: a_y = v^2 * kappa
-        a_y = (v * v) * kappa_hat
-
-        # 3) desired lean: alpha_d = atan(a_y/g)
-        alpha_d_raw = math.atan2(a_y, self.p.g)
-
-        # 4) constraint: max tilt angle
-        alpha_d_cmd = clamp(alpha_d_raw, -self.p.alpha_max_rad, self.p.alpha_max_rad)
-
-        # 5) constraint: max tilt rate
-        prev = self._alpha_d_prev
-        max_step = self.p.alpha_rate_max * dt
-        alpha_d = clamp(alpha_d_cmd, prev - max_step, prev + max_step)
-        alpha_d_dot = (alpha_d - prev) / dt
-        self._alpha_d_prev = alpha_d
-
-        # 6) PD tracking -> torque for roll plant
-        tau = (
-            self.p.I * (self.p.kp * (alpha_d - alpha) + self.p.kd * (alpha_d_dot - alpha_dot))
-            + self.p.b * alpha_dot
-        )
-        tau = clamp(tau, -self.p.tau_max, self.p.tau_max)
-
-        # 7) speed cap enhancement
-        v_max = self.fallback_speed_cap(kappa_hat)
-
-        return tau, alpha_d, kappa_hat, v_max, a_y
-
-
-# -------------------------
-# Simple Roll Plant for Simulation
-# -------------------------
-def roll_dynamics_step(alpha: float, alpha_dot: float, tau: float, I: float, b: float, dt: float):
+def roll_dynamics_step(alpha, alpha_dot, tau, I, b, dt):
     alpha_ddot = (tau - b * alpha_dot) / I
     alpha_dot_next = alpha_dot + alpha_ddot * dt
     alpha_next = alpha + alpha_dot_next * dt
     return alpha_next, alpha_dot_next
 
+def alpha_from_kappa(v, kappa, g, alpha_max_rad):
+    ay = v * v * kappa
+    alpha_d = math.atan2(ay, g)
+    alpha_d = clamp(alpha_d, -alpha_max_rad, alpha_max_rad)
+    return alpha_d, ay
 
-# -------------------------
-# Scenarios (generate v, yaw_rate_r)
-# -------------------------
-def scenario_straight(t: float):
-    v = 15.0
-    r = 0.0
-    return v, r
+def alpha_from_yaw_rate(v, yaw_rate, g, alpha_max_rad):
+    ay = v * yaw_rate
+    alpha_d = math.atan2(ay, g)
+    alpha_d = clamp(alpha_d, -alpha_max_rad, alpha_max_rad)
+    return alpha_d, ay
 
-def scenario_constant_turn(t: float):
-    v = 15.0
-    rho = 60.0
-    r = v / rho
-    return v, r
+def yaw_rate_measurement(v, kappa_true, rng, bias=0.0, noise_std=0.0):
+    r_true = v * kappa_true
+    noise = rng.normal(0.0, noise_std) if noise_std > 0.0 else 0.0
+    r_meas = r_true + bias + noise
+    return r_true, r_meas
 
-def scenario_s_curve(t: float):
-    v = 15.0
-    r = 0.25 * math.sin(0.5 * t)
-    return v, r
+def kappa_est_from_yaw(v, yaw_rate):
+    if abs(v) < V_EPS:
+        return 0.0
+    return yaw_rate / v
 
-def scenario_tight_fast(t: float):
-    v = 25.0
-    rho = 25.0
-    r = v / rho
-    return v, r
+# ============================================================
+# SCENARIOS
+# ============================================================
 
+def scenario_straight(t):
+    return 15.0, 0.0
 
-# -------------------------
-# Simulation Runner
-# -------------------------
-def run_sim(scenario_fn, T: float = 20.0, dt: float = 0.01):
+def scenario_constant_turn(t):
+    return 15.0, 1.0 / 60.0
+
+def scenario_s_curve(t):
+    return 15.0, 0.02 * math.sin(0.5 * t)
+
+def scenario_saturation(t):
+    return 25.0, 1.0 / 25.0
+
+# ============================================================
+# SIMULATION
+# ============================================================
+
+def run_sim(scenario_fn, name="", T=T_SIM, dt=DT, seed=RNG_SEED):
     p = LeanControllerParams()
-    ctrl = LeanIntoCornerController(p)
+    rng = np.random.default_rng(seed)
 
-    n = int(T / dt)
-    t_arr = np.linspace(0.0, T, n, endpoint=False)
+    n = int(T / dt) + 1
+    t_vec = np.linspace(0.0, T, n)
 
-    alpha = 0.0
-    alpha_dot = 0.0
+    v_k = v_r = 0.0
+    alpha_k = alpha_r = 0.0
+    alpha_dot_k = alpha_dot_r = 0.0
+    yaw_filt = 0.0
 
-    # Minimal logging (only what we need)
-    log = {k: [] for k in [
-        "t", "v", "kappa_hat", "alpha", "alpha_dot", "alpha_d", "v_max",
-        "a_y", "a_side_seat"
-    ]}
-
-    for t in t_arr:
-        v, yaw_rate_r = scenario_fn(t)
-
-        tau, alpha_d, kappa_hat, v_max, a_y = ctrl.step(
-            v=v, yaw_rate_r=yaw_rate_r, alpha=alpha, alpha_dot=alpha_dot, dt=dt
-        )
-
-        # Update roll plant (actual seat/cabin tilt)
-        alpha, alpha_dot = roll_dynamics_step(alpha, alpha_dot, tau, p.I, p.b, dt)
-
-        # Occupant "door-slam" metric: seat-frame lateral acceleration
-        # target: ~0
-        a_side_seat = a_y * math.cos(alpha) - p.g * math.sin(alpha)
-
-        # Log
-        log["t"].append(t)
-        log["v"].append(v)
-        log["kappa_hat"].append(kappa_hat)
-        log["alpha"].append(alpha)
-        log["alpha_dot"].append(alpha_dot)
-        log["alpha_d"].append(alpha_d)
-        log["v_max"].append(v_max)
-        log["a_y"].append(a_y)
-        log["a_side_seat"].append(a_side_seat)
-
-    for k in log:
-        log[k] = np.array(log[k], dtype=float)
-
-    # Quick numeric proof (useful even if plots are off)
-    a = log["a_side_seat"]
-    metrics = {
-        "a_side_seat_rms": float(np.sqrt(np.mean(a**2))),
-        "a_side_seat_max_abs": float(np.max(np.abs(a))),
+    log = {
+        "t": np.zeros(n),
+        "v_des": np.zeros(n),
+        "kappa_true": np.zeros(n),
+        "kappa_est": np.zeros(n),
+        "yaw_rate_filt": np.zeros(n),
+        "v_k": np.zeros(n),
+        "v_r": np.zeros(n),
+        "alpha_k": np.zeros(n),
+        "alpha_r": np.zeros(n),
+        "alpha_d_k": np.zeros(n),
+        "alpha_d_r": np.zeros(n),
+        "fy_k": np.zeros(n),
+        "fy_r": np.zeros(n),
     }
 
-    return log, p, metrics
+    for i, ti in enumerate(t_vec):
+        v_des, kappa_true = scenario_fn(ti)
 
+        # MAP PATH
+        v_max_k = speed_limit_for_curvature(kappa_true, p.alpha_max_rad, p.g)
+        v_k = speed_dynamics_step(v_k, min(v_des, v_max_k), p.v_track_tau, dt)
 
-# -------------------------
-# Minimal Plotting
-# -------------------------
-def plot_log_minimal(log, title: str):
+        alpha_d_k, ay_k = alpha_from_kappa(v_k, kappa_true, p.g, p.alpha_max_rad)
+        tau_k = p.Kp * (alpha_d_k - alpha_k) - p.Kd * alpha_dot_k
+        alpha_k, alpha_dot_k = roll_dynamics_step(alpha_k, alpha_dot_k, tau_k, p.I, p.b, dt)
+
+        fy_k = ay_k * math.cos(alpha_k) - p.g * math.sin(alpha_k)
+
+        # YAW-ONLY PATH
+        kappa_prev = log["kappa_est"][i - 1] if i > 0 else 0.0
+        v_max_r = speed_limit_for_curvature(kappa_prev, p.alpha_max_rad, p.g)
+        v_r = speed_dynamics_step(v_r, min(v_des, v_max_r), p.v_track_tau, dt)
+
+        _, yaw_meas = yaw_rate_measurement(
+            v_r, kappa_true, rng, YAW_BIAS_RAD_S, YAW_NOISE_STD
+        )
+        yaw_filt = lowpass_1st_order(yaw_filt, yaw_meas, YAW_FILTER_TAU_S, dt)
+        kappa_est = kappa_est_from_yaw(v_r, yaw_filt)
+
+        alpha_d_r, ay_r = alpha_from_yaw_rate(v_r, yaw_filt, p.g, p.alpha_max_rad)
+        tau_r = p.Kp * (alpha_d_r - alpha_r) - p.Kd * alpha_dot_r
+        alpha_r, alpha_dot_r = roll_dynamics_step(alpha_r, alpha_dot_r, tau_r, p.I, p.b, dt)
+
+        fy_r = ay_r * math.cos(alpha_r) - p.g * math.sin(alpha_r)
+
+        # LOG
+        log["t"][i] = ti
+        log["v_des"][i] = v_des
+        log["kappa_true"][i] = kappa_true
+        log["kappa_est"][i] = kappa_est
+        log["yaw_rate_filt"][i] = yaw_filt
+        log["v_k"][i] = v_k
+        log["v_r"][i] = v_r
+        log["alpha_k"][i] = alpha_k
+        log["alpha_r"][i] = alpha_r
+        log["alpha_d_k"][i] = alpha_d_k
+        log["alpha_d_r"][i] = alpha_d_r
+        log["fy_k"][i] = fy_k
+        log["fy_r"][i] = fy_r
+
+    return log, p
+
+# ============================================================
+# PLOTS (4 PER SCENARIO)
+# ============================================================
+
+def plot_log_4(log, p, name, fig_base):
     t = log["t"]
 
-    # 1) Curvature estimate
-    plt.figure()
-    plt.plot(t, log["kappa_hat"])
-    plt.xlabel("time (s)")
-    plt.ylabel("curvature kappa_hat (1/m)")
-    plt.title(f"{title}: curvature estimate")
+    plt.figure(fig_base + 0)
+    plt.plot(t, log["kappa_true"], label="kappa_true")
+    plt.plot(t, log["kappa_est"], label="kappa_est (yaw)", linestyle=":")
+    plt.legend(); plt.grid(); plt.title(f"{name}: curvature")
 
-    # 2) Lean tracking
-    plt.figure()
-    plt.plot(t, np.degrees(log["alpha"]), label="alpha (actual)")
-    plt.plot(t, np.degrees(log["alpha_d"]), label="alpha_d (command)", linestyle=":")
-    plt.xlabel("time (s)")
-    plt.ylabel("lean angle (deg)")
-    plt.title(f"{title}: lean tracking")
-    plt.legend()
+    plt.figure(fig_base + 1)
+    plt.plot(t, log["v_k"], label="v_map")
+    plt.plot(t, log["v_r"], label="v_yaw")
+    plt.legend(); plt.grid(); plt.title(f"{name}: speed")
 
-    # 3) Objective proof: occupant sideways push
-    plt.figure()
-    plt.plot(t, log["a_side_seat"])
-    plt.xlabel("time (s)")
-    plt.ylabel("a_side_seat (m/s^2)")
-    plt.title(f"{title}: occupant sideways push (target ~ 0)")
+    plt.figure(fig_base + 2)
+    plt.plot(t, log["fy_k"], label="f_y seat (map)")
+    plt.plot(t, log["fy_r"], label="f_y seat (yaw)", linestyle=":")
+    plt.axhline(0.0, linestyle="--", color="k")
+    plt.legend(); plt.grid(); plt.title(f"{name}: comfort metric")
 
-    # 4) Enhancement: speed vs fallback cap (NaNs will be skipped)
-    plt.figure()
-    plt.plot(t, log["v"], label="v")
-    plt.plot(t, log["v_max"], label="v_max (fallback cap)", linestyle=":")
-    plt.xlabel("time (s)")
-    plt.ylabel("speed (m/s)")
-    plt.title(f"{title}: speed vs fallback cap")
-    plt.legend()
+    plt.figure(fig_base + 3)
+    plt.plot(t, np.degrees(log["alpha_k"]), label="alpha_map")
+    plt.plot(t, np.degrees(log["alpha_d_k"]), linestyle=":", label="alpha_d_map")
+    plt.plot(t, np.degrees(log["alpha_r"]), label="alpha_yaw")
+    plt.plot(t, np.degrees(log["alpha_d_r"]), linestyle=":", label="alpha_d_yaw")
+    plt.axhline(p.alpha_max_deg, linestyle="--", color="k")
+    plt.axhline(-p.alpha_max_deg, linestyle="--", color="k")
+    plt.legend(); plt.grid(); plt.title(f"{name}: seat roll")
 
+# ============================================================
+# MAIN
+# ============================================================
 
-# -------------------------
-# Main
-# -------------------------
 def main():
+    plt.close("all")
+
     tests = [
         ("straight", scenario_straight),
         ("constant_turn", scenario_constant_turn),
         ("s_curve", scenario_s_curve),
-        ("tight_fast", scenario_tight_fast),
+        ("saturation", scenario_saturation),
     ]
 
-    for name, fn in tests:
-        t0 = time.perf_counter()
-        log, _, metrics = run_sim(fn, T=20.0, dt=0.01)
-        t1 = time.perf_counter()
+    for i, (name, fn) in enumerate(tests):
+        log, p = run_sim(fn, name)
+        print(f"{name}: max |f_y| map = {np.max(np.abs(log['fy_k'])):.3f}, "
+              f"yaw = {np.max(np.abs(log['fy_r'])):.3f}")
+        plot_log_4(log, p, name, fig_base=100 + 10 * i)
 
-        print(f"{name}: runtime {t1 - t0:.4f} s for {len(log['t'])} steps")
-        print(f"  a_side_seat RMS: {metrics['a_side_seat_rms']:.4f} m/s^2")
-        print(f"  max |a_side_seat|: {metrics['a_side_seat_max_abs']:.4f} m/s^2")
-
-        if PLOT:
-            plot_log_minimal(log, name)
-
-    if PLOT:
-        plt.show()
-
+    plt.show()
 
 if __name__ == "__main__":
     main()
