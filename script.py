@@ -6,6 +6,7 @@
 
 import math
 import time
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -34,6 +35,11 @@ YAW_FILTER_TAU_S = 0.25
 
 V_EPS = 1e-3
 RNG_SEED = 1
+
+# Output folder for plots (keeps your project root clean)
+PLOTS_DIR = "plots"
+SAVE_PNG = True       # set False if you don't want to save files
+SHOW_WINDOWS = False  # set True if you want plot windows to pop up
 
 # ============================================================
 # PARAMETERS
@@ -106,6 +112,30 @@ def kappa_est_from_yaw(v, yaw_rate):
     if abs(v) < V_EPS:
         return 0.0
     return yaw_rate / v
+
+def ensure_clean_plots_dir():
+    if not SAVE_PNG:
+        return
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+
+def clear_old_pngs():
+    if not SAVE_PNG:
+        return
+    if not os.path.isdir(PLOTS_DIR):
+        return
+    for fn in os.listdir(PLOTS_DIR):
+        if fn.lower().endswith(".png"):
+            try:
+                os.remove(os.path.join(PLOTS_DIR, fn))
+            except OSError:
+                pass
+
+def save_current_figure(filename):
+    if not SAVE_PNG:
+        return
+    ensure_clean_plots_dir()
+    out_path = os.path.join(PLOTS_DIR, filename)
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
 
 # ============================================================
 # SCENARIOS
@@ -213,17 +243,20 @@ def plot_log_4(log, p, name, fig_base):
     plt.plot(t, log["kappa_true"], label="kappa_true")
     plt.plot(t, log["kappa_est"], label="kappa_est (yaw)", linestyle=":")
     plt.legend(); plt.grid(); plt.title(f"{name}: curvature")
+    save_current_figure(f"{name}_1_curvature.png")
 
     plt.figure(fig_base + 1)
     plt.plot(t, log["v_k"], label="v_map")
     plt.plot(t, log["v_r"], label="v_yaw")
     plt.legend(); plt.grid(); plt.title(f"{name}: speed")
+    save_current_figure(f"{name}_2_speed_limit.png")
 
     plt.figure(fig_base + 2)
     plt.plot(t, log["fy_k"], label="f_y seat (map)")
     plt.plot(t, log["fy_r"], label="f_y seat (yaw)", linestyle=":")
     plt.axhline(0.0, linestyle="--", color="k")
     plt.legend(); plt.grid(); plt.title(f"{name}: comfort metric")
+    save_current_figure(f"{name}_3_lateral_accel.png")
 
     plt.figure(fig_base + 3)
     plt.plot(t, np.degrees(log["alpha_k"]), label="alpha_map")
@@ -233,12 +266,20 @@ def plot_log_4(log, p, name, fig_base):
     plt.axhline(p.alpha_max_deg, linestyle="--", color="k")
     plt.axhline(-p.alpha_max_deg, linestyle="--", color="k")
     plt.legend(); plt.grid(); plt.title(f"{name}: seat roll")
+    save_current_figure(f"{name}_4_lean_tracking.png")
 
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
+    print("RUNNING:", os.path.abspath(__file__))
+    print("CWD:", os.getcwd())
+
+    if SAVE_PNG:
+        ensure_clean_plots_dir()
+        clear_old_pngs()
+
     plt.close("all")
 
     tests = [
@@ -250,11 +291,19 @@ def main():
 
     for i, (name, fn) in enumerate(tests):
         log, p = run_sim(fn, name)
-        print(f"{name}: max |f_y| map = {np.max(np.abs(log['fy_k'])):.3f}, "
-              f"yaw = {np.max(np.abs(log['fy_r'])):.3f}")
+        print(
+            f"{name}: max |f_y| map = {np.max(np.abs(log['fy_k'])):.3f}, "
+            f"yaw = {np.max(np.abs(log['fy_r'])):.3f}"
+        )
         plot_log_4(log, p, name, fig_base=100 + 10 * i)
 
-    plt.show()
+    if SHOW_WINDOWS:
+        plt.show()
+    else:
+        plt.close("all")
+
+    if SAVE_PNG:
+        print(f"Saved plots to .\\{PLOTS_DIR}\\")
 
 if __name__ == "__main__":
     main()
